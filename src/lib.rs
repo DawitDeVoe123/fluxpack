@@ -6,10 +6,14 @@
 pub mod symbol_table;
 pub mod varint;
 pub mod error;
+pub mod encoder;
+pub mod decoder;
 
 pub use symbol_table::SymbolTable;
 pub use varint::{encode_varint, decode_varint, varint_len};
 pub use error::FluxPackError;
+pub use encoder::Encoder;
+pub use decoder::Decoder;
 
 /// Magic bytes that identify a FluxPack stream: F X P 0x01
 pub const MAGIC: [u8; 4] = [0x46, 0x58, 0x50, 0x01];
@@ -44,4 +48,59 @@ pub enum ValueType {
     Object = 0x0A,
     Interned = 0x0B,
     Timestamp = 0x0C,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn test_encoder_basic() {
+        let mut encoder = Encoder::new();
+        let msg = json!({
+            "user_id": 8821,
+            "email": "user@example.com",
+            "active": true
+        });
+
+        let encoded = encoder.encode(&msg).unwrap();
+        assert!(!encoded.is_empty());
+        
+        // First frame should be DEF for "user_id"
+        assert_eq!(encoded[0], 0x01); // DEF frame
+        
+        // The last frame should be DATA
+        // Find the DATA frame marker
+        let mut data_frame_start = None;
+        for i in 0..encoded.len() {
+            if encoded[i] == 0x02 {
+                data_frame_start = Some(i);
+                break;
+            }
+        }
+        assert!(data_frame_start.is_some(), "DATA frame not found");
+    }
+
+    #[test]
+    fn test_encoder_decoder_roundtrip() {
+        let mut encoder = Encoder::new();
+        let mut decoder = Decoder::new();
+        
+        let original = json!({
+            "user_id": 8821,
+            "email": "user@example.com",
+            "active": true,
+            "nested": {
+                "field1": "value1",
+                "field2": 42
+            },
+            "list": [1, 2, 3, "hello"]
+        });
+
+        let encoded = encoder.encode(&original).unwrap();
+        let decoded = decoder.decode(encoded).unwrap();
+        
+        assert_eq!(original, decoded);
+    }
 }
