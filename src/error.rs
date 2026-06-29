@@ -37,4 +37,19 @@ pub enum FluxPackError {
 
     #[error("Internal error")]
     InternalError,
+
+    #[error("Columnar encoding failed: {0}")]
+    ColumnarError(String),
+
+    #[error("Unsupported tensor dtype: {0}")]
+    UnsupportedTensorDtype(u8),
+
+    #[error("Shape mismatch: expected {expected} elements, got {got}")]
+    TensorShapeMismatch { expected: usize, got: usize },
+
+    #[error("Incomplete stream: expected {expected} more frames")]
+    IncompleteStream { expected: usize },
+
+    #[error("Schema mismatch: {0}")]
+    SchemaMismatch(String),
 }

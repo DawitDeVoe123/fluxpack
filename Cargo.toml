@@ -1,22 +1,39 @@
 [package]
 name = "fluxpack"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 authors = ["FluxPack Engineering <hi@fluxpack.io>"]
-description = "A schema‑free, Shannon‑optimal serialisation format"
+description = "Schema-free, Shannon-optimal serialisation — faster and smaller than JSON for ML pipelines"
 repository = "https://github.com/DawitDeVoe123/fluxpack"
 license = "MIT OR Apache-2.0"
 readme = "README.md"
+
+[lib]
+name = "fluxpack"
+crate-type = ["rlib"]
+
+[features]
+default = []
+parallel = ["rayon"]
+compression = ["zstd"]
+python = ["pyo3"]
 
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "1.0"
 bytes = "1.5"
+rayon = { version = "1.10", optional = true }
+zstd = { version = "0.13", optional = true }
+pyo3 = { version = "0.22", features = ["extension-module"], optional = true }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
 
-#[[bench]]
-#name = "benchmark"
-#harness = false
+[[bench]]
+name = "multi"
+harness = false
+
+[[bench]]
+name = "perf"
+harness = false

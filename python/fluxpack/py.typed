@@ -1,0 +1,91 @@
+"""Type stubs for fluxpack._fluxpack"""
+
+from typing import Any, Dict, List, Optional, Union
+
+__version__: str
+
+def encode(data: Dict[str, Any]) -> bytes:
+    """Encode a Python dict to FluxPack bytes."""
+    ...
+
+def decode(data: bytes) -> Dict[str, Any]:
+    """Decode FluxPack bytes to a Python dict."""
+    ...
+
+def encode_batch(messages: List[Dict[str, Any]]) -> bytes:
+    """Encode multiple dicts to a single FluxPack batch."""
+    ...
+
+def decode_batch(data: bytes) -> List[Dict[str, Any]]:
+    """Decode a FluxPack batch to a list of Python dicts."""
+    ...
+
+def encode_compressed(data: Dict[str, Any], level: int = 3) -> bytes:
+    """Encode and compress in one step."""
+    ...
+
+def decode_compressed(data: bytes) -> Dict[str, Any]:
+    """Decompress and decode in one step."""
+    ...
+
+class Encoder:
+    """Encoder with state reuse for streaming ML pipelines."""
+
+    def __init__(self) -> None: ...
+    def encode(self, data: Dict[str, Any]) -> bytes:
+        """Encode a dict to FluxPack bytes."""
+        ...
+    def encode_with_columnar(self, data: Dict[str, Any]) -> bytes:
+        """Encode with columnar optimization for arrays of objects."""
+        ...
+    def encode_batch(self, messages: List[Dict[str, Any]]) -> bytes:
+        """Encode a batch of dicts."""
+        ...
+    def reset(self) -> None:
+        """Reset the encoder state."""
+        ...
+    def symbol_table_size(self) -> int:
+        """Get the symbol table size."""
+        ...
+
+class Decoder:
+    """Decoder with state reuse."""
+
+    def __init__(self) -> None: ...
+    def decode(self, data: bytes) -> Dict[str, Any]:
+        """Decode FluxPack bytes to a Python dict."""
+        ...
+    def decode_all(self, data: bytes) -> List[Dict[str, Any]]:
+        """Decode a batch of messages."""
+        ...
+    def reset(self) -> None:
+        """Reset the decoder state."""
+        ...
+
+class StreamWriter:
+    """Streaming writer for frame-level encoding."""
+
+    def __init__(self) -> None: ...
+    def write_def(self, key: str) -> int:
+        """Write a DEF frame for a key."""
+        ...
+    def write_data(self, data: Dict[str, Any]) -> None:
+        """Write a DATA frame."""
+        ...
+    def finish(self) -> bytes:
+        """Get the accumulated buffer."""
+        ...
+    def reset(self) -> None:
+        """Reset the writer."""
+        ...
+
+class StreamReader:
+    """Streaming reader for frame-level decoding."""
+
+    def __init__(self) -> None: ...
+    def read_all(self, data: bytes) -> List[Dict[str, Any]]:
+        """Read all frames from bytes."""
+        ...
+    def reset(self) -> None:
+        """Reset the reader."""
+        ...
