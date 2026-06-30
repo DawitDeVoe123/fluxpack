@@ -17,6 +17,9 @@ use crate::FluxPackError;
 /// Default compression level.
 pub const DEFAULT_COMPRESSION_LEVEL: i32 = 3;
 
+/// Minimum input size for zstd to be beneficial (adds overhead for small payloads).
+pub const MIN_COMPRESS_SIZE: usize = 64;
+
 /// Compress a FluxPack stream using zstd.
 pub fn compress(input: &[u8]) -> Result<Vec<u8>, FluxPackError> {
     compress_with_level(input, DEFAULT_COMPRESSION_LEVEL)
@@ -36,11 +39,23 @@ pub fn decompress(input: &[u8]) -> Result<Vec<u8>, FluxPackError> {
 
 /// Compress with a pre-allocated dictionary for better compression of similar messages.
 /// The dictionary should be trained on representative data.
-pub fn compress_with_dict(input: &[u8], _dict: &[u8], level: i32) -> Result<Vec<u8>, FluxPackError> {
-    // Dictionary-based compression requires trained dictionaries.
-    // For now, fall back to standard compression.
-    // TODO: Add zstd dict training via `zstd::dict::from_samples`
-    compress_with_level(input, level)
+pub fn compress_with_dict(input: &[u8], dict: &[u8], level: i32) -> Result<Vec<u8>, FluxPackError> {
+    let mut output = Vec::new();
+    {
+        let mut encoder = zstd::Encoder::with_dictionary(&mut output, level, dict)
+            .map_err(|e| FluxPackError::ColumnarError(format!("zstd dict compression failed: {}", e)))?;
+        std::io::Write::write_all(&mut encoder, input)
+            .map_err(|e| FluxPackError::ColumnarError(format!("zstd dict write failed: {}", e)))?;
+        encoder.finish()
+            .map_err(|e| FluxPackError::ColumnarError(format!("zstd dict finish failed: {}", e)))?;
+    }
+    Ok(output)
+}
+
+/// Train a zstd dictionary from sample data for better compression of similar messages.
+pub fn train_dictionary(samples: &[&[u8]], max_size: usize) -> Result<Vec<u8>, FluxPackError> {
+    zstd::dict::from_samples(samples, max_size)
+        .map_err(|e| FluxPackError::ColumnarError(format!("zstd dict training failed: {}", e)))
 }
 
 /// Compression stats for measuring ratio.
@@ -106,6 +121,28 @@ pub fn optimal_compress(input: &[u8]) -> Result<(Vec<u8>, i32, CompressionStats)
     best.ok_or(FluxPackError::ColumnarError("no compression level worked".into()))
 }
 
+/// Smart compress: skips compression if input is too small, otherwise uses optimal level.
+pub fn smart_compress(input: &[u8]) -> Result<Vec<u8>, FluxPackError> {
+    if input.len() < MIN_COMPRESS_SIZE {
+        return Ok(input.to_vec());
+    }
+    compress(input)
+}
+
+/// Compress with estimated size reduction.
+/// Returns None if compression would increase size.
+pub fn try_compress(input: &[u8]) -> Result<Option<Vec<u8>>, FluxPackError> {
+    if input.len() < MIN_COMPRESS_SIZE {
+        return Ok(None);
+    }
+    let compressed = compress(input)?;
+    if compressed.len() < input.len() {
+        Ok(Some(compressed))
+    } else {
+        Ok(None)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -136,7 +173,6 @@ mod tests {
     #[test]
     fn test_compression_ratio() {
         let mut encoder = Encoder::new();
-        // Create a realistic ML payload
         let data = json!({
             "experiment_id": "exp_2024_001",
             "model": "transformer_v3",
@@ -165,7 +201,6 @@ mod tests {
         println!("Compressed: {} bytes", compressed.len());
         println!("Ratio: {:.2}x, Savings: {:.1}%", stats.ratio, stats.savings_percent);
 
-        // Zstd should compress FluxPack further
         assert!(compressed.len() < fluxpack_bytes.len(),
             "Compressed ({}) should be smaller than FluxPack ({})",
             compressed.len(), fluxpack_bytes.len());
@@ -185,7 +220,6 @@ mod tests {
 
         for &level in &levels {
             let compressed = compress_with_level(&fluxpack_bytes, level).unwrap();
-            // Higher levels should produce smaller or equal output
             assert!(compressed.len() <= prev_size,
                 "Level {} ({}) should be <= level {} ({})",
                 level, compressed.len(),
@@ -197,8 +231,6 @@ mod tests {
 
     #[test]
     fn test_total_pipeline_compression() {
-        // JSON → FluxPack → zstd comparison
-        // Use a larger payload where zstd shines
         let data = json!({
             "job_id": "training_job_001",
             "model_type": "random_forest",
@@ -240,14 +272,84 @@ mod tests {
             (1.0 - compressed.len() as f64 / json_bytes.len() as f64) * 100.0);
         println!("Total compression: {:.2}x", stats.ratio);
 
-        // FluxPack alone should be smaller than JSON
         assert!(fluxpack_bytes.len() < json_bytes.len(),
             "FluxPack ({}) should be smaller than JSON ({})",
             fluxpack_bytes.len(), json_bytes.len());
 
-        // zstd should compress FluxPack further for larger payloads
         assert!(compressed.len() < fluxpack_bytes.len(),
             "Compressed ({}) should be smaller than FluxPack ({})",
             compressed.len(), fluxpack_bytes.len());
+    }
+
+    #[test]
+    fn test_smart_compress_skips_small() {
+        let small_data = vec![0u8; 32];
+        let result = smart_compress(&small_data).unwrap();
+        assert_eq!(result, small_data, "Small data should not be compressed");
+    }
+
+    #[test]
+    fn test_smart_compress_compresses_large() {
+        let mut encoder = Encoder::new();
+        let data = json!({
+            "values": (0..1000).map(|i| json!(i as f64 * 0.001)).collect::<Vec<_>>()
+        });
+        let fluxpack_bytes = encoder.encode(&data).unwrap().to_vec();
+        let result = smart_compress(&fluxpack_bytes).unwrap();
+        assert!(result.len() < fluxpack_bytes.len(), "Large data should be compressed");
+    }
+
+    #[test]
+    fn test_try_compress_returns_none_for_small() {
+        let small_data = vec![0u8; 32];
+        let result = try_compress(&small_data).unwrap();
+        assert!(result.is_none(), "Small data should return None");
+    }
+
+    #[test]
+    fn test_try_compress_returns_some_for_large() {
+        let mut encoder = Encoder::new();
+        let data = json!({
+            "values": (0..1000).map(|i| json!(i as f64 * 0.001)).collect::<Vec<_>>()
+        });
+        let fluxpack_bytes = encoder.encode(&data).unwrap().to_vec();
+        let result = try_compress(&fluxpack_bytes).unwrap();
+        assert!(result.is_some(), "Large compressible data should return Some");
+    }
+
+    #[test]
+    fn test_train_dictionary() {
+        let samples: Vec<Vec<u8>> = (0..10).map(|i| {
+            let data = json!({
+                "epoch": i,
+                "loss": 1.0 - i as f64 * 0.1,
+                "accuracy": i as f64 * 0.1
+            });
+            let mut encoder = Encoder::new();
+            encoder.encode(&data).unwrap().to_vec()
+        }).collect();
+
+        let sample_refs: Vec<&[u8]> = samples.iter().map(|s| s.as_slice()).collect();
+        let dict = train_dictionary(&sample_refs, 1024).unwrap();
+
+        assert!(!dict.is_empty(), "Dictionary should not be empty");
+
+        // Compress with dictionary should work
+        let compressed = compress_with_dict(&sample_refs[0], &dict, 3).unwrap();
+        // Decompression also needs the dictionary
+        let mut decoder = zstd::Decoder::with_dictionary(&compressed[..], &dict).unwrap();
+        let mut decompressed = Vec::new();
+        std::io::Read::read_to_end(&mut decoder, &mut decompressed).unwrap();
+        assert_eq!(sample_refs[0], decompressed.as_slice());
+    }
+
+    #[test]
+    fn test_compression_stats() {
+        let stats = CompressionStats::new(1000, 500);
+        assert_eq!(stats.original_size, 1000);
+        assert_eq!(stats.compressed_size, 500);
+        assert!((stats.ratio - 2.0).abs() < 0.01);
+        assert_eq!(stats.savings_bytes, 500);
+        assert!((stats.savings_percent - 50.0).abs() < 0.01);
     }
 }

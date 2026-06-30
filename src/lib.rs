@@ -13,6 +13,8 @@ pub mod stream;
 pub mod delta;
 pub mod tensor;
 pub mod zero_copy;
+pub mod ml;
+pub mod inline;
 
 #[cfg(feature = "parallel")]
 pub mod parallel;
@@ -34,6 +36,13 @@ pub use stream::{StreamWriter, StreamReader, Frame};
 pub use delta::{encode_delta, decode_delta, should_delta_encode};
 pub use tensor::{Tensor, TensorDtype, encode_tensor, decode_tensor};
 pub use zero_copy::{ZeroCopyValue, decode_zero_copy, decode_all_zero_copy, to_owned};
+pub use ml::{
+    FeatureVector, encode_feature_vector, decode_feature_vector,
+    SparseTensor, encode_sparse_tensor, decode_sparse_tensor, sparse_to_dense,
+    Hyperparams, encode_hyperparams, decode_hyperparams,
+    encode_timestamp, decode_timestamp,
+    encode_timestamps_deltas, decode_timestamps_deltas,
+};
 
 /// Magic bytes that identify a FluxPack stream: F X P 0x01
 pub const MAGIC: [u8; 4] = [0x46, 0x58, 0x50, 0x01];
@@ -378,5 +387,251 @@ mod tests {
             (1.0 - fp_bytes.len() as f64 / json_bytes.len() as f64) * 100.0);
 
         assert!(fp_bytes.len() < json_bytes.len());
+    }
+
+    #[test]
+    fn test_edge_empty_object() {
+        let mut encoder = Encoder::new();
+        let mut decoder = Decoder::new();
+        let original = json!({});
+        let encoded = encoder.encode(&original).unwrap();
+        let decoded = decoder.decode(encoded).unwrap();
+        assert_eq!(original, decoded);
+    }
+
+    #[test]
+    fn test_edge_unicode_strings() {
+        let mut encoder = Encoder::new();
+        let mut decoder = Decoder::new();
+        let original = json!({
+            "emoji": "🚀💻🧠",
+            "chinese": "机器学习",
+            "arabic": "تعلم الآلة",
+            "japanese": "機械学習",
+            "mixed": "Hello 世界 🌍"
+        });
+        let encoded = encoder.encode(&original).unwrap();
+        let decoded = decoder.decode(encoded).unwrap();
+        assert_eq!(original, decoded);
+    }
+
+    #[test]
+    fn test_edge_deeply_nested() {
+        let mut encoder = Encoder::new();
+        let mut decoder = Decoder::new();
+        let original = json!({
+            "l1": {
+                "l2": {
+                    "l3": {
+                        "l4": {
+                            "l5": {
+                                "l6": {
+                                    "l7": {
+                                        "l8": {
+                                            "l9": {
+                                                "l10": "deep value"
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        let encoded = encoder.encode(&original).unwrap();
+        let decoded = decoder.decode(encoded).unwrap();
+        assert_eq!(original, decoded);
+    }
+
+    #[test]
+    fn test_edge_large_array() {
+        let mut encoder = Encoder::new();
+        let mut decoder = Decoder::new();
+        let values: Vec<serde_json::Value> = (0..10000).map(|i| json!(i)).collect();
+        let original = json!({"values": values});
+        let encoded = encoder.encode(&original).unwrap();
+        let decoded = decoder.decode(encoded).unwrap();
+        assert_eq!(original, decoded);
+    }
+
+    #[test]
+    fn test_edge_boundary_varint_values() {
+        let mut encoder = Encoder::new();
+        let mut decoder = Decoder::new();
+        let original = json!({
+            "zero": 0,
+            "one": 1,
+            "127": 127,
+            "128": 128,
+            "16383": 16383,
+            "16384": 16384,
+            "max_u64": 18446744073709551615_u64
+        });
+        let encoded = encoder.encode(&original).unwrap();
+        let decoded = decoder.decode(encoded).unwrap();
+        assert_eq!(original, decoded);
+    }
+
+    #[test]
+    fn test_edge_negative_numbers() {
+        let mut encoder = Encoder::new();
+        let mut decoder = Decoder::new();
+        let original = json!({
+            "neg_one": -1,
+            "neg_max_i32": -2147483648,
+            "neg_large": -9223372036854775808_i64,
+            "float_neg": -3.14159,
+            "float_small": -1e-10
+        });
+        let encoded = encoder.encode(&original).unwrap();
+        let decoded = decoder.decode(encoded).unwrap();
+        assert_eq!(original, decoded);
+    }
+
+    #[test]
+    fn test_edge_empty_arrays() {
+        let mut encoder = Encoder::new();
+        let mut decoder = Decoder::new();
+        let original = json!({
+            "empty_arr": [],
+            "empty_obj": {},
+            "nested_empty": [[], [], []]
+        });
+        let encoded = encoder.encode(&original).unwrap();
+        let decoded = decoder.decode(encoded).unwrap();
+        assert_eq!(original, decoded);
+    }
+
+    #[test]
+    fn test_edge_mixed_types() {
+        let mut encoder = Encoder::new();
+        let mut decoder = Decoder::new();
+        let original = json!({
+            "null_val": null,
+            "bool_true": true,
+            "bool_false": false,
+            "int": 42,
+            "float": 3.14,
+            "string": "hello",
+            "array": [1, 2, 3],
+            "object": {"key": "value"}
+        });
+        let encoded = encoder.encode(&original).unwrap();
+        let decoded = decoder.decode(encoded).unwrap();
+        assert_eq!(original, decoded);
+    }
+
+    #[test]
+    fn test_edge_special_float_values() {
+        let mut encoder = Encoder::new();
+        let mut decoder = Decoder::new();
+        let original = json!({
+            "pi": 3.141592653589793,
+            "e": 2.718281828459045,
+            "sqrt2": 1.4142135623730951,
+            "zero": 0.0,
+            "neg_zero": -0.0,
+            "large": 1.7976931348623157e+308,
+            "tiny": 5e-324
+        });
+        let encoded = encoder.encode(&original).unwrap();
+        let decoded = decoder.decode(encoded).unwrap();
+        assert_eq!(original, decoded);
+    }
+
+    #[test]
+    fn test_edge_long_strings() {
+        let mut encoder = Encoder::new();
+        let mut decoder = Decoder::new();
+        let long_string = "a".repeat(10000);
+        let original = json!({
+            "long": long_string,
+            "short": "x"
+        });
+        let encoded = encoder.encode(&original).unwrap();
+        let decoded = decoder.decode(encoded).unwrap();
+        assert_eq!(original, decoded);
+    }
+
+    #[test]
+    fn test_edge_many_keys() {
+        let mut encoder = Encoder::new();
+        let mut decoder = Decoder::new();
+        let mut obj = serde_json::Map::new();
+        for i in 0..100 {
+            obj.insert(format!("key_{}", i), json!(i));
+        }
+        let original = Value::Object(obj);
+        let encoded = encoder.encode(&original).unwrap();
+        let decoded = decoder.decode(encoded).unwrap();
+        assert_eq!(original, decoded);
+    }
+
+    #[test]
+    fn test_edge_batch_large() {
+        let mut encoder = Encoder::new();
+        let mut decoder = Decoder::new();
+        let messages: Vec<Value> = (0..1000).map(|i| {
+            json!({
+                "id": i,
+                "value": i as f64 * 0.1,
+                "name": format!("item_{}", i)
+            })
+        }).collect();
+        let encoded = encoder.encode_batch(&messages).unwrap().to_vec();
+        let decoded = decoder.decode_all(&encoded).unwrap();
+        assert_eq!(decoded.len(), 1000);
+        for (i, msg) in decoded.iter().enumerate() {
+            assert_eq!(msg["id"], json!(i));
+        }
+    }
+
+    #[test]
+    fn test_edge_zero_copy_unicode() {
+        let mut encoder = Encoder::new();
+        let original = json!({
+            "emoji": "🚀",
+            "text": "Hello 世界"
+        });
+        let encoded = encoder.encode(&original).unwrap().to_vec();
+        let decoded = decode_zero_copy(&encoded).unwrap();
+        assert_eq!(decoded.get("emoji").unwrap().as_str(), Some("🚀"));
+        assert_eq!(decoded.get("text").unwrap().as_str(), Some("Hello 世界"));
+    }
+
+    #[test]
+    fn test_edge_columnar_empty() {
+        let mut encoder = Encoder::new();
+        let mut decoder = Decoder::new();
+        let original = json!({
+            "empty_col": []
+        });
+        let encoded = encoder.encode_with_columnar(&original).unwrap().to_vec();
+        let decoded = decoder.decode(&encoded).unwrap();
+        assert_eq!(original, decoded);
+    }
+
+    #[test]
+    fn test_edge_delta_encoding_negative() {
+        let values = vec![json!(-100), json!(-99), json!(-97), json!(-93)];
+        let mut buf = Vec::new();
+        encode_delta(&values, &mut buf).unwrap();
+        let (decoded, _) = decode_delta(&buf).unwrap();
+        assert_eq!(decoded, values);
+    }
+
+    #[test]
+    fn test_edge_tensor_large() {
+        let data: Vec<f64> = (0..100000).map(|i| i as f64 * 0.001).collect();
+        let tensor = Tensor::from_f64(&data, vec![1000, 100]);
+
+        let mut buf = Vec::new();
+        encode_tensor(&tensor, &mut buf);
+
+        let (decoded, _) = decode_tensor(&buf).unwrap();
+        assert_eq!(decoded.shape, vec![1000, 100]);
+        assert_eq!(decoded.data, tensor.data);
     }
 }

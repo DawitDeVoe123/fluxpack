@@ -1,6 +1,7 @@
 use serde_json::{Value, Number, Map};
 use crate::{SymbolTable, FluxPackError, decode_varint, decode_signed_varint};
 use crate::columnar::{decode_columnar, reconstruct_array};
+use crate::inline::{decode_inline, INLINE_MAGIC};
 
 /// The FluxPack decoder.
 /// Takes a FluxPack binary stream and reconstructs the JSON.
@@ -16,8 +17,15 @@ impl Decoder {
     }
 
     /// Decode a FluxPack stream into a JSON value.
-    /// Handles DEF frames, DATA frames, and columnar frames.
+    /// Handles both inline mode (small payloads) and standard mode.
     pub fn decode(&mut self, input: &[u8]) -> Result<Value, FluxPackError> {
+        // Check for inline mode
+        if !input.is_empty() && input[0] == INLINE_MAGIC {
+            let (obj, _) = decode_inline(input)
+                .map_err(|e| FluxPackError::ColumnarError(e))?;
+            return Ok(Value::Object(obj));
+        }
+
         let mut cursor = 0;
         let mut result = None;
 
@@ -28,8 +36,6 @@ impl Decoder {
             match frame_type {
                 0x01 => {
                     // DEF frame — build the symbol table using EXACT token IDs from the wire.
-                    // CRITICAL: We must use store_def() instead of intern() to preserve
-                    // the encoder's token assignments.
                     let (token, consumed) = decode_varint(&input[cursor..])?;
                     cursor += consumed;
 
@@ -71,6 +77,14 @@ impl Decoder {
         let mut cursor = 0;
 
         while cursor < input.len() {
+            // Check for inline mode
+            if input[cursor] == INLINE_MAGIC {
+                let (obj, consumed) = self.decode_inline_at(&input[cursor..])?;
+                cursor += consumed;
+                results.push(obj);
+                continue;
+            }
+
             let frame_type = input[cursor];
             cursor += 1;
 
@@ -102,6 +116,13 @@ impl Decoder {
         }
 
         Ok(results)
+    }
+
+    /// Decode an inline-encoded message, returning the value and bytes consumed.
+    fn decode_inline_at(&self, input: &[u8]) -> Result<(Value, usize), FluxPackError> {
+        let (obj, consumed) = decode_inline(input)
+            .map_err(|e| FluxPackError::ColumnarError(e))?;
+        Ok((Value::Object(obj), consumed))
     }
 
     fn decode_data_frame(&mut self, input: &[u8]) -> Result<Value, FluxPackError> {

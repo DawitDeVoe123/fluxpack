@@ -1,6 +1,7 @@
 use serde_json::Value;
 use crate::{SymbolTable, FluxPackError, encode_varint, encode_signed_varint, MAX_TOKENS};
 use crate::columnar::{try_columnarize, encode_columnar};
+use crate::inline::{encode_inline, INLINE_THRESHOLD};
 
 /// The FluxPack encoder.
 /// Takes a JSON value and emits a FluxPack binary stream.
@@ -18,6 +19,8 @@ pub struct Encoder {
     zigzag: bool,
     /// When true, skip DEF frame emission (for parallel batch encoding)
     skip_defs: bool,
+    /// When true, use inline mode for small payloads
+    inline_mode: bool,
 }
 
 impl Encoder {
@@ -31,7 +34,14 @@ impl Encoder {
             previous_schema_fp: 0,
             zigzag: true,
             skip_defs: false,
+            inline_mode: false,
         }
+    }
+
+    /// Enable or disable inline mode for small payloads.
+    /// When enabled, payloads < 256 bytes use a compact format without symbol tables.
+    pub fn set_inline_mode(&mut self, enabled: bool) {
+        self.inline_mode = enabled;
     }
 
     /// Encode a JSON message into a FluxPack binary stream.
@@ -45,8 +55,16 @@ impl Encoder {
             .as_object()
             .ok_or(FluxPackError::ExpectedObject)?;
 
-        // Compute current schema fingerprint
-        // (interning keys will update the symbol table)
+        // Try inline mode for small payloads when enabled
+        if self.inline_mode {
+            let inline_result = encode_inline(obj);
+            if !inline_result.is_empty() && inline_result.len() <= INLINE_THRESHOLD {
+                self.output = inline_result;
+                return Ok(&self.output);
+            }
+        }
+
+        // Standard mode
         // First, intern all keys to compute the schema
         for (key, value) in obj {
             self.symbol_table.intern(key)?;
@@ -277,15 +295,9 @@ impl Encoder {
     #[inline(always)]
     fn encode_value(&mut self, value: &Value) -> Result<(), FluxPackError> {
         match value {
-            Value::Null => {
-                self.output.push(0x00);
-            }
-            Value::Bool(true) => {
-                self.output.push(0x01);
-            }
-            Value::Bool(false) => {
-                self.output.push(0x02);
-            }
+            Value::Null => self.output.push(0x00),
+            Value::Bool(true) => self.output.push(0x01),
+            Value::Bool(false) => self.output.push(0x02),
             Value::Number(n) => {
                 if let Some(i) = n.as_i64() {
                     self.output.push(0x03);
@@ -306,8 +318,9 @@ impl Encoder {
             }
             Value::String(s) => {
                 self.output.push(0x05);
-                encode_varint(s.len() as u64, &mut self.output);
-                self.output.extend_from_slice(s.as_bytes());
+                let bytes = s.as_bytes();
+                encode_varint(bytes.len() as u64, &mut self.output);
+                self.output.extend_from_slice(bytes);
             }
             Value::Array(arr) => {
                 self.output.push(0x09);

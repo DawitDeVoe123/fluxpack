@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use ahash::AHashMap;
 use crate::MAX_TOKENS;
 
 /// Pre-defined common ML pipeline field names for zero-cost interning.
@@ -10,16 +10,27 @@ pub const COMMON_ML_KEYS: &[&str] = &[
     "train_loss", "test_loss", "f1", "precision", "recall",
 ];
 
+/// Pre-defined keys indexed by token for O(1) lookup during encoding.
+pub const COMMON_ML_KEYS_BY_TOKEN: &[&str] = &[
+    "", // token 0 unused
+    "epoch", "loss", "accuracy", "val_loss", "val_accuracy",
+    "learning_rate", "batch_size", "step", "timestamp", "status",
+    "model_type", "optimizer", "lr", "metrics", "config",
+    "train_loss", "test_loss", "f1", "precision", "recall",
+];
+
 /// The shared symbol table that both encoder and decoder maintain.
 #[derive(Debug, Clone)]
 pub struct SymbolTable {
-    id_to_key: HashMap<u16, String>,
-    key_to_id: HashMap<String, u16>,
+    id_to_key: AHashMap<u16, String>,
+    key_to_id: AHashMap<String, u16>,
     next_token: u16,
     /// Tracks which tokens have had DEF frames emitted (encoder only)
     emitted_defs: Vec<bool>,
     /// Schema fingerprint: hash of all keys in insertion order
     schema_fingerprint: u64,
+    /// Cached sorted tokens for fingerprint calculation
+    sorted_tokens_cache: Vec<u16>,
 }
 
 impl SymbolTable {
@@ -30,8 +41,8 @@ impl SymbolTable {
     /// Create a new symbol table pre-loaded with common ML keys.
     /// This gives a huge speedup for typical ML pipelines.
     pub fn with_predefined() -> Self {
-        let mut id_to_key = HashMap::with_capacity(64);
-        let mut key_to_id = HashMap::with_capacity(64);
+        let mut id_to_key = AHashMap::with_capacity(64);
+        let mut key_to_id = AHashMap::with_capacity(64);
         let mut next_token: u16 = 1;
 
         // Pre-register common ML keys for zero-overhead interning
@@ -45,12 +56,14 @@ impl SymbolTable {
         }
 
         let emitted_count = (next_token - 1) as usize;
+        let sorted_tokens_cache: Vec<u16> = (1..next_token).collect();
         Self {
             id_to_key,
             key_to_id,
             next_token,
             emitted_defs: vec![true; emitted_count],
-            schema_fingerprint: 0, // Will be computed on first access
+            schema_fingerprint: 0,
+            sorted_tokens_cache,
         }
     }
 
@@ -70,7 +83,7 @@ impl SymbolTable {
         self.key_to_id.insert(key.to_string(), id);
         self.id_to_key.insert(id, key.to_string());
         self.emitted_defs.push(false);
-        // Invalidate fingerprint
+        self.sorted_tokens_cache.push(id);
         self.schema_fingerprint = 0;
         Ok(id)
     }
@@ -84,7 +97,6 @@ impl SymbolTable {
         }
 
         if self.id_to_key.contains_key(&token) {
-            // Already stored — verify consistency
             if let Some(existing) = self.id_to_key.get(&token) {
                 if existing != key {
                     return Err(crate::FluxPackError::DuplicateDef(token));
@@ -96,17 +108,18 @@ impl SymbolTable {
         self.key_to_id.insert(key.to_string(), token);
         self.id_to_key.insert(token, key.to_string());
 
-        // Ensure emitted_defs is large enough
         let idx = token as usize;
         if idx >= self.emitted_defs.len() {
             self.emitted_defs.resize(idx + 1, false);
         }
 
-        // Ensure next_token stays ahead
         if token >= self.next_token {
             self.next_token = token + 1;
         }
 
+        self.sorted_tokens_cache.push(token);
+        self.sorted_tokens_cache.sort_unstable();
+        self.sorted_tokens_cache.dedup();
         self.schema_fingerprint = 0;
         Ok(())
     }
@@ -156,11 +169,9 @@ impl SymbolTable {
         if self.schema_fingerprint != 0 {
             return self.schema_fingerprint;
         }
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        let mut hasher = ahash::AHasher::default();
         use std::hash::{Hash, Hasher};
-        let mut tokens: Vec<u16> = self.id_to_key.keys().copied().collect();
-        tokens.sort_unstable();
-        for token in tokens {
+        for &token in &self.sorted_tokens_cache {
             if let Some(key) = self.id_to_key.get(&token) {
                 token.hash(&mut hasher);
                 key.hash(&mut hasher);
@@ -202,6 +213,7 @@ impl SymbolTable {
         self.next_token = 1;
         self.emitted_defs.clear();
         self.schema_fingerprint = 0;
+        self.sorted_tokens_cache.clear();
 
         // Re-register common ML keys
         for &key in COMMON_ML_KEYS {
@@ -211,28 +223,33 @@ impl SymbolTable {
             self.key_to_id.insert(key.to_string(), self.next_token);
             self.id_to_key.insert(self.next_token, key.to_string());
             self.emitted_defs.push(true);
+            self.sorted_tokens_cache.push(self.next_token);
             self.next_token += 1;
         }
     }
 
     /// Returns an iterator over all (token, key) pairs in token order.
     pub fn iter(&self) -> impl Iterator<Item = (u16, &str)> {
-        let mut pairs: Vec<(u16, &str)> = self
-            .id_to_key
+        self.sorted_tokens_cache
             .iter()
-            .map(|(&id, key)| (id, key.as_str()))
-            .collect();
-        pairs.sort_unstable_by_key(|&(id, _)| id);
-        pairs.into_iter()
+            .filter_map(|&token| self.id_to_key.get(&token).map(|key| (token, key.as_str())))
     }
 
     /// Returns the list of tokens that need DEF frames emitted.
     pub fn pending_defs(&self) -> Vec<(u16, &str)> {
-        self.id_to_key
+        self.sorted_tokens_cache
             .iter()
-            .filter(|(&token, _)| !self.def_emitted(token))
-            .map(|(&token, key)| (token, key.as_str()))
+            .filter(|&&token| !self.def_emitted(token))
+            .filter_map(|&token| self.id_to_key.get(&token).map(|key| (token, key.as_str())))
             .collect()
+    }
+
+    /// Returns the count of pending DEF frames.
+    pub fn pending_defs_count(&self) -> usize {
+        self.sorted_tokens_cache
+            .iter()
+            .filter(|&&token| !self.def_emitted(token))
+            .count()
     }
 }
 

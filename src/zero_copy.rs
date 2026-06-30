@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use ahash::AHashMap;
 use crate::{FluxPackError, decode_varint, decode_signed_varint};
 
 /// Zero-copy value type that borrows strings directly from the input buffer.
@@ -103,16 +103,16 @@ impl<'a> ZeroCopyValue<'a> {
 
 /// Zero-copy symbol table that borrows key strings from the input buffer.
 pub struct ZeroCopySymbolTable<'a> {
-    id_to_key: HashMap<u16, &'a str>,
-    key_to_id: HashMap<&'a str, u16>,
+    id_to_key: AHashMap<u16, &'a str>,
+    key_to_id: AHashMap<&'a str, u16>,
     next_token: u16,
 }
 
 impl<'a> ZeroCopySymbolTable<'a> {
     pub fn new() -> Self {
         let mut table = Self {
-            id_to_key: HashMap::new(),
-            key_to_id: HashMap::new(),
+            id_to_key: AHashMap::with_capacity(64),
+            key_to_id: AHashMap::with_capacity(64),
             next_token: 1,
         };
         // Pre-load common ML keys to match encoder's pre-defined tokens
@@ -146,9 +146,63 @@ impl<'a> Default for ZeroCopySymbolTable<'a> {
     }
 }
 
+/// Convert a serde_json::Value to a ZeroCopyValue (owned, not zero-copy).
+fn convert_value_to_zerocopy_static(v: serde_json::Value) -> Option<ZeroCopyValue<'static>> {
+    match v {
+        serde_json::Value::Null => Some(ZeroCopyValue::Null),
+        serde_json::Value::Bool(b) => Some(ZeroCopyValue::Bool(b)),
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                Some(ZeroCopyValue::Int(i))
+            } else if let Some(u) = n.as_u64() {
+                Some(ZeroCopyValue::Uint(u))
+            } else if let Some(f) = n.as_f64() {
+                Some(ZeroCopyValue::Float64(f))
+            } else {
+                None
+            }
+        }
+        serde_json::Value::String(s) => {
+            let leaked: &'static str = Box::leak(s.into_boxed_str());
+            Some(ZeroCopyValue::String(leaked))
+        }
+        serde_json::Value::Array(arr) => {
+            let vals: Vec<ZeroCopyValue<'static>> = arr.into_iter()
+                .filter_map(convert_value_to_zerocopy_static)
+                .collect();
+            Some(ZeroCopyValue::Array(vals))
+        }
+        serde_json::Value::Object(obj) => {
+            let fields: Vec<(&'static str, ZeroCopyValue<'static>)> = obj.into_iter()
+                .filter_map(|(k, v)| {
+                    let k_static: &'static str = Box::leak(k.into_boxed_str());
+                    let zv = convert_value_to_zerocopy_static(v)?;
+                    Some((k_static, zv))
+                })
+                .collect();
+            Some(ZeroCopyValue::Object(fields))
+        }
+    }
+}
+
 /// Decode a FluxPack stream into a zero-copy value.
 /// All string references are borrowed from the input buffer.
 pub fn decode_zero_copy<'a>(input: &'a [u8]) -> Result<ZeroCopyValue<'a>, FluxPackError> {
+    // Check for inline mode
+    if !input.is_empty() && input[0] == crate::inline::INLINE_MAGIC {
+        let (obj, consumed) = crate::inline::decode_inline(input)
+            .map_err(|e| FluxPackError::ColumnarError(e))?;
+        let fields: Vec<(&'a str, ZeroCopyValue<'a>)> = obj.into_iter()
+            .filter_map(|(k, v)| {
+                let k_static: &'static str = Box::leak(k.into_boxed_str());
+                let zv = convert_value_to_zerocopy_static(v)?;
+                Some((k_static, zv))
+            })
+            .collect();
+        let _ = consumed;
+        return Ok(ZeroCopyValue::Object(fields));
+    }
+
     let mut cursor = 0;
     let mut table = ZeroCopySymbolTable::new();
     let mut result = None;
@@ -190,6 +244,22 @@ pub fn decode_all_zero_copy<'a>(input: &'a [u8]) -> Result<Vec<ZeroCopyValue<'a>
     let mut results = Vec::new();
 
     while cursor < input.len() {
+        // Check for inline mode
+        if input[cursor] == crate::inline::INLINE_MAGIC {
+            let (obj, consumed) = crate::inline::decode_inline(&input[cursor..])
+                .map_err(|e| FluxPackError::ColumnarError(e))?;
+            let fields: Vec<(&'a str, ZeroCopyValue<'a>)> = obj.into_iter()
+                .filter_map(|(k, v)| {
+                    let k_static: &'static str = Box::leak(k.into_boxed_str());
+                    let zv = convert_value_to_zerocopy_static(v)?;
+                    Some((k_static, zv))
+                })
+                .collect();
+            cursor += consumed;
+            results.push(ZeroCopyValue::Object(fields));
+            continue;
+        }
+
         let frame_type = input[cursor];
         cursor += 1;
 
