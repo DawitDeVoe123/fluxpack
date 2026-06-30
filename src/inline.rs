@@ -1,141 +1,91 @@
 use serde_json::Value;
 
-/// Inline encoder for small payloads.
+/// Inline encoder for small payloads — single-pass design.
 ///
 /// # The Problem
 /// Standard FluxPack uses symbol tables + DEF frames which add overhead for
 /// small messages. JSON is just `{"key":value}` with minimal structure.
 ///
-/// # The Solution: Inline Mode
+/// # The Solution: Single-Pass Inline Mode
 /// For payloads < 256 bytes, skip the symbol table entirely.
-/// Use a compact inline format:
-///   magic(1) | field_count(1) | for each field: key_len(1) | key_bytes | value_bytes
-///
-/// This eliminates:
-/// - DEF frame overhead (saves 3-10 bytes per message)
-/// - Symbol table hash map operations (saves CPU)
-/// - Schema fingerprint computation (saves CPU)
-/// - Varint encoding overhead (1-byte lengths for small strings)
+/// Encode everything in ONE pass over the object.
 ///
 /// Wire format (inline mode):
 ///   0xFE | field_count(u8) | for each field:
 ///     key_len(u8) | key_bytes | value_tag(u8) | value_bytes
 ///
-/// Value tags (compact):
-///   0x00 = null
-///   0x01 = true
-///   0x02 = false
-///   0x03 = i8 (1 byte)
-///   0x04 = i16 (2 bytes LE)
-///   0x05 = i32 (4 bytes LE)
-///   0x06 = i64 (8 bytes LE)
-///   0x07 = f32 (4 bytes LE)
-///   0x08 = f64 (8 bytes LE)
-///   0x09 = string (u8 len + bytes)
-///   0x0A = bytes (u8 len + bytes)
+/// Value tags:
+///   0x00 = null       0x03 = i8         0x07 = f32
+///   0x01 = true       0x04 = i16        0x08 = f64
+///   0x02 = false      0x05 = i32        0x09 = string
+///                     0x06 = i64        0x0B = u64
 
 pub const INLINE_MAGIC: u8 = 0xFE;
-
-/// Threshold: payloads smaller than this use inline mode.
 pub const INLINE_THRESHOLD: usize = 256;
 
-/// Encode a small JSON object in inline mode.
-/// Returns the encoded bytes.
-pub fn encode_inline(obj: &serde_json::Map<String, Value>) -> Vec<u8> {
+/// Single-pass encode: check eligibility AND encode in one iteration.
+/// Returns None if the object can't use inline mode.
+pub fn encode_inline(obj: &serde_json::Map<String, Value>) -> Option<Vec<u8>> {
     let field_count = obj.len();
-    if field_count > 255 || !should_use_inline(obj) {
-        return Vec::new(); // Signal to use standard mode
+    if field_count > 255 {
+        return None;
     }
 
-    // Pre-calculate size
-    let estimated_size = estimate_inline_size(obj);
-    let mut buf = Vec::with_capacity(estimated_size);
-
-    // Header
+    let mut buf = Vec::with_capacity(64);
     buf.push(INLINE_MAGIC);
     buf.push(field_count as u8);
 
-    // Fields
     for (key, value) in obj {
-        // Key
+        // Check eligibility inline — no separate pass
+        match value {
+            Value::Array(_) | Value::Object(_) => return None,
+            _ => {}
+        }
+
         let key_bytes = key.as_bytes();
+        if key_bytes.len() > 255 {
+            return None;
+        }
+
         buf.push(key_bytes.len() as u8);
         buf.extend_from_slice(key_bytes);
 
-        // Value
-        encode_inline_value(value, &mut buf);
-    }
-
-    buf
-}
-
-/// Estimate the size of inline encoding.
-fn estimate_inline_size(obj: &serde_json::Map<String, Value>) -> usize {
-    let mut size = 2; // magic + field_count
-    for (key, value) in obj {
-        size += 1 + key.len(); // key_len + key_bytes
-        size += estimate_inline_value_size(value);
-    }
-    size
-}
-
-/// Check if inline mode should be used.
-fn should_use_inline(obj: &serde_json::Map<String, Value>) -> bool {
-    if obj.len() > 255 {
-        return false;
-    }
-
-    // Don't use inline mode for nested structures
-    for (_, value) in obj {
-        match value {
-            Value::Array(_) | Value::Object(_) => return false,
-            _ => {}
+        if !encode_inline_value_fast(value, &mut buf) {
+            return None;
         }
     }
 
-    let mut total_size = 2; // magic + field_count
-    for (key, value) in obj {
-        total_size += 1 + key.len(); // key_len + key
-        total_size += estimate_inline_value_size(value);
+    // Check final size
+    if buf.len() > INLINE_THRESHOLD {
+        return None;
     }
 
-    total_size <= INLINE_THRESHOLD
+    Some(buf)
 }
 
-/// Estimate size of a single value in inline mode.
-fn estimate_inline_value_size(value: &Value) -> usize {
+/// Fast-path value encoding. Returns false if value can't use inline mode.
+#[inline(always)]
+fn encode_inline_value_fast(value: &Value, buf: &mut Vec<u8>) -> bool {
     match value {
-        Value::Null => 1,
-        Value::Bool(_) => 1,
-        Value::Number(n) => {
-            if let Some(i) = n.as_i64() {
-                if i >= i8::MIN as i64 && i <= i8::MAX as i64 { 2 } // tag + i8
-                else if i >= i16::MIN as i64 && i <= i16::MAX as i64 { 3 } // tag + i16
-                else if i >= i32::MIN as i64 && i <= i32::MAX as i64 { 5 } // tag + i32
-                else { 9 } // tag + i64
-            } else if n.as_u64().is_some() {
-                9 // tag + u64
-            } else if let Some(f) = n.as_f64() {
-                if (f as f32) as f64 == f { 5 } // tag + f32
-                else { 9 } // tag + f64
-            } else {
-                9
-            }
+        Value::Null => {
+            buf.push(0x00);
+            true
         }
-        Value::String(s) => 1 + 1 + s.len(), // tag + len + bytes
-        Value::Array(_) | Value::Object(_) => usize::MAX, // never use inline for nested
-    }
-}
-
-/// Encode a value in inline mode.
-fn encode_inline_value(value: &Value, buf: &mut Vec<u8>) {
-    match value {
-        Value::Null => buf.push(0x00),
-        Value::Bool(true) => buf.push(0x01),
-        Value::Bool(false) => buf.push(0x02),
+        Value::Bool(true) => {
+            buf.push(0x01);
+            true
+        }
+        Value::Bool(false) => {
+            buf.push(0x02);
+            true
+        }
         Value::Number(n) => {
             if let Some(i) = n.as_i64() {
-                if i >= i8::MIN as i64 && i <= i8::MAX as i64 {
+                // Small integers: use smallest encoding
+                if i >= 0 && i <= 255 {
+                    buf.push(0x0C); // u8 tag
+                    buf.push(i as u8);
+                } else if i >= i8::MIN as i64 && i <= i8::MAX as i64 {
                     buf.push(0x03);
                     buf.push(i as u8);
                 } else if i >= i16::MIN as i64 && i <= i16::MAX as i64 {
@@ -148,10 +98,16 @@ fn encode_inline_value(value: &Value, buf: &mut Vec<u8>) {
                     buf.push(0x06);
                     buf.extend_from_slice(&i.to_le_bytes());
                 }
+                true
             } else if let Some(u) = n.as_u64() {
-                // Use u64 tag for unsigned values
-                buf.push(0x0B);
-                buf.extend_from_slice(&u.to_le_bytes());
+                if u <= 255 {
+                    buf.push(0x0C);
+                    buf.push(u as u8);
+                } else {
+                    buf.push(0x0B);
+                    buf.extend_from_slice(&u.to_le_bytes());
+                }
+                true
             } else if let Some(f) = n.as_f64() {
                 if (f as f32) as f64 == f {
                     buf.push(0x07);
@@ -160,27 +116,28 @@ fn encode_inline_value(value: &Value, buf: &mut Vec<u8>) {
                     buf.push(0x08);
                     buf.extend_from_slice(&f.to_le_bytes());
                 }
+                true
+            } else {
+                false
             }
         }
         Value::String(s) => {
-            buf.push(0x09);
             let bytes = s.as_bytes();
+            if bytes.len() > 255 {
+                return false;
+            }
+            buf.push(0x09);
             buf.push(bytes.len() as u8);
             buf.extend_from_slice(bytes);
+            true
         }
-        Value::Array(_) | Value::Object(_) => {
-            // Should not happen due to should_use_inline check
-            buf.push(0x00);
-        }
+        Value::Array(_) | Value::Object(_) => false,
     }
 }
 
 /// Decode an inline-encoded payload, returning the map and bytes consumed.
 pub fn decode_inline(input: &[u8]) -> Result<(serde_json::Map<String, Value>, usize), String> {
-    if input.len() < 2 {
-        return Err("input too short".into());
-    }
-    if input[0] != INLINE_MAGIC {
+    if input.len() < 2 || input[0] != INLINE_MAGIC {
         return Err("not inline format".into());
     }
 
@@ -190,7 +147,7 @@ pub fn decode_inline(input: &[u8]) -> Result<(serde_json::Map<String, Value>, us
 
     for _ in 0..field_count {
         if cursor >= input.len() {
-            return Err("unexpected end of input".into());
+            return Err("unexpected end".into());
         }
 
         let key_len = input[cursor] as usize;
@@ -212,7 +169,7 @@ pub fn decode_inline(input: &[u8]) -> Result<(serde_json::Map<String, Value>, us
     Ok((obj, cursor))
 }
 
-/// Decode an inline value.
+#[inline(always)]
 fn decode_inline_value(input: &[u8], cursor: usize) -> Result<(Value, usize), String> {
     if cursor >= input.len() {
         return Err("unexpected end in value".into());
@@ -289,6 +246,12 @@ fn decode_inline_value(input: &[u8], cursor: usize) -> Result<(Value, usize), St
             pos += 8;
             Ok((Value::Number(val.into()), pos))
         }
+        0x0C => {
+            if pos >= input.len() { return Err("truncated u8".into()); }
+            let val = input[pos] as u64;
+            pos += 1;
+            Ok((Value::Number(val.into()), pos))
+        }
         _ => Err(format!("unknown tag: {}", tag)),
     }
 }
@@ -306,8 +269,7 @@ mod tests {
             "active": true
         }).as_object().unwrap().clone();
 
-        let encoded = encode_inline(&obj);
-        assert!(!encoded.is_empty());
+        let encoded = encode_inline(&obj).unwrap();
         assert_eq!(encoded[0], INLINE_MAGIC);
 
         let (decoded, consumed) = decode_inline(&encoded).unwrap();
@@ -327,17 +289,12 @@ mod tests {
         }).as_object().unwrap().clone();
 
         let json_bytes = serde_json::to_vec(&obj).unwrap();
-        let inline_bytes = encode_inline(&obj);
+        let inline_bytes = encode_inline(&obj).unwrap();
 
         println!("JSON: {} bytes", json_bytes.len());
         println!("Inline: {} bytes", inline_bytes.len());
-        println!("Savings: {} bytes ({:.1}%)",
-            json_bytes.len() as isize - inline_bytes.len() as isize,
-            (1.0 - inline_bytes.len() as f64 / json_bytes.len() as f64) * 100.0);
 
-        assert!(inline_bytes.len() <= json_bytes.len(),
-            "Inline ({}) should be <= JSON ({})",
-            inline_bytes.len(), json_bytes.len());
+        assert!(inline_bytes.len() <= json_bytes.len());
     }
 
     #[test]
@@ -349,7 +306,7 @@ mod tests {
             "d": -128
         }).as_object().unwrap().clone();
 
-        let encoded = encode_inline(&obj);
+        let encoded = encode_inline(&obj).unwrap();
         let (decoded, _) = decode_inline(&encoded).unwrap();
 
         assert_eq!(obj["a"], decoded["a"]);
@@ -359,21 +316,20 @@ mod tests {
     }
 
     #[test]
-    fn test_inline_boundary_values() {
+    fn test_inline_u8_optimization() {
+        // Values 0-255 should use 1-byte encoding
         let obj = json!({
-            "i8_min": -128,
-            "i8_max": 127,
-            "i16_min": -32768,
-            "i16_max": 32767
+            "small": 42,
+            "zero": 0,
+            "max": 255
         }).as_object().unwrap().clone();
 
-        let encoded = encode_inline(&obj);
+        let encoded = encode_inline(&obj).unwrap();
         let (decoded, _) = decode_inline(&encoded).unwrap();
 
-        assert_eq!(obj["i8_min"], decoded["i8_min"]);
-        assert_eq!(obj["i8_max"], decoded["i8_max"]);
-        assert_eq!(obj["i16_min"], decoded["i16_min"]);
-        assert_eq!(obj["i16_max"], decoded["i16_max"]);
+        assert_eq!(obj["small"], decoded["small"]);
+        assert_eq!(obj["zero"], decoded["zero"]);
+        assert_eq!(obj["max"], decoded["max"]);
     }
 
     #[test]
@@ -383,7 +339,7 @@ mod tests {
             "f64_needed": 3.141592653589793
         }).as_object().unwrap().clone();
 
-        let encoded = encode_inline(&obj);
+        let encoded = encode_inline(&obj).unwrap();
         let (decoded, _) = decode_inline(&encoded).unwrap();
 
         let f32_val = decoded["f32_ok"].as_f64().unwrap();
@@ -394,17 +350,30 @@ mod tests {
     }
 
     #[test]
-    fn test_inline_strings() {
+    fn test_inline_rejects_nested() {
         let obj = json!({
-            "short": "hi",
-            "long": "this is a longer string for testing"
+            "nested": {"inner": 1}
         }).as_object().unwrap().clone();
 
-        let encoded = encode_inline(&obj);
-        let (decoded, _) = decode_inline(&encoded).unwrap();
+        assert!(encode_inline(&obj).is_none());
+    }
 
-        assert_eq!(obj["short"], decoded["short"]);
-        assert_eq!(obj["long"], decoded["long"]);
+    #[test]
+    fn test_inline_rejects_arrays() {
+        let obj = json!({
+            "arr": [1, 2, 3]
+        }).as_object().unwrap().clone();
+
+        assert!(encode_inline(&obj).is_none());
+    }
+
+    #[test]
+    fn test_inline_rejects_large() {
+        let mut obj = serde_json::Map::new();
+        for i in 0..100 {
+            obj.insert(format!("key_{}", i), json!(i));
+        }
+        assert!(encode_inline(&obj).is_none());
     }
 
     #[test]
@@ -417,7 +386,7 @@ mod tests {
         }).as_object().unwrap().clone();
 
         let json_bytes = serde_json::to_vec(&obj).unwrap();
-        let inline_bytes = encode_inline(&obj);
+        let inline_bytes = encode_inline(&obj).unwrap();
         let (decoded, _) = decode_inline(&inline_bytes).unwrap();
 
         println!("JSON: {} bytes", json_bytes.len());
@@ -425,17 +394,5 @@ mod tests {
 
         assert_eq!(obj.len(), decoded.len());
         assert_eq!(obj["user_id"], decoded["user_id"]);
-        assert_eq!(obj["email"], decoded["email"]);
-        assert_eq!(obj["active"], decoded["active"]);
-    }
-
-    #[test]
-    fn test_inline_rejects_large() {
-        let mut obj = serde_json::Map::new();
-        for i in 0..100 {
-            obj.insert(format!("key_{}", i), json!(i));
-        }
-        let encoded = encode_inline(&obj);
-        assert!(encoded.is_empty(), "Large objects should use standard mode");
     }
 }

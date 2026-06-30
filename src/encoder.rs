@@ -1,7 +1,7 @@
 use serde_json::Value;
 use crate::{SymbolTable, FluxPackError, encode_varint, encode_signed_varint, MAX_TOKENS};
 use crate::columnar::{try_columnarize, encode_columnar};
-use crate::inline::{encode_inline, INLINE_THRESHOLD};
+use crate::inline::encode_inline;
 
 /// The FluxPack encoder.
 /// Takes a JSON value and emits a FluxPack binary stream.
@@ -57,8 +57,7 @@ impl Encoder {
 
         // Try inline mode for small payloads when enabled
         if self.inline_mode {
-            let inline_result = encode_inline(obj);
-            if !inline_result.is_empty() && inline_result.len() <= INLINE_THRESHOLD {
+            if let Some(inline_result) = encode_inline(obj) {
                 self.output = inline_result;
                 return Ok(&self.output);
             }
@@ -221,6 +220,7 @@ impl Encoder {
 
     /// Encode only the DATA frame (no DEF frames).
     /// Used internally for parallel batch encoding.
+    #[cfg(feature = "parallel")]
     pub(crate) fn encode_data_only(&mut self, message: &Value) -> Result<&[u8], FluxPackError> {
         self.output.clear();
 

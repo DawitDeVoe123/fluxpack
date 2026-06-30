@@ -42,3 +42,7 @@ harness = false
 [[bench]]
 name = "inline"
 harness = false
+
+[[bench]]
+name = "full"
+harness = false
