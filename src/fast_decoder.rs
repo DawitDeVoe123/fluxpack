@@ -1,27 +1,103 @@
+use ahash::AHashMap;
+use crate::{FluxPackError, decode_varint, decode_signed_varint};
+use crate::inline::INLINE_MAGIC;
+use crate::symbol_table::COMMON_ML_KEYS;
 use serde_json::{Value, Number, Map};
-use crate::{SymbolTable, FluxPackError, decode_varint, decode_signed_varint};
-use crate::columnar::{decode_columnar, reconstruct_array};
-use crate::inline::{decode_inline, INLINE_MAGIC};
+use std::sync::Arc;
 
-/// The FluxPack decoder.
-/// Takes a FluxPack binary stream and reconstructs the JSON.
-pub struct Decoder {
-    symbol_table: SymbolTable,
+/// Pre-computed key cache for hot-path decoding.
+/// Stores Arc<str> so cloning is O(1) (just a reference count increment).
+struct KeyCache {
+    keys: Vec<Arc<str>>,
 }
 
-impl Decoder {
+impl KeyCache {
+    fn new() -> Self {
+        let mut keys = Vec::with_capacity(256);
+        for &key in COMMON_ML_KEYS {
+            keys.push(Arc::from(key));
+        }
+        Self { keys }
+    }
+
+    #[inline]
+    fn get_or_insert(&mut self, token: u16, key: &str) -> Arc<str> {
+        let idx = token as usize;
+        if idx < self.keys.len() && !self.keys[idx].is_empty() {
+            return Arc::clone(&self.keys[idx]);
+        }
+        let arc = Arc::from(key);
+        if idx >= self.keys.len() {
+            self.keys.resize_with(idx + 1, || Arc::from(""));
+        }
+        self.keys[idx] = Arc::clone(&arc);
+        arc
+    }
+
+    #[inline]
+    fn get(&self, token: u16) -> Option<Arc<str>> {
+        let idx = token as usize;
+        if idx < self.keys.len() && !self.keys[idx].is_empty() {
+            Some(Arc::clone(&self.keys[idx]))
+        } else {
+            None
+        }
+    }
+}
+
+/// Fast FluxPack decoder optimized for ML workloads.
+///
+/// Key optimizations over standard Decoder:
+/// 1. Arc<str> key cache — cloning is O(1) instead of O(n)
+/// 2. Pre-computed common ML keys — no allocation for epoch, loss, accuracy, etc.
+/// 3. Inlined hot paths — eliminates function call overhead
+pub struct FastDecoder {
+    key_cache: KeyCache,
+    key_to_id: AHashMap<Arc<str>, u16>,
+    next_token: u16,
+}
+
+impl FastDecoder {
     pub fn new() -> Self {
+        let key_cache = KeyCache::new();
+        let mut key_to_id = AHashMap::with_capacity(64);
+        let mut next_token: u16 = 1;
+
+        for &key in COMMON_ML_KEYS {
+            let arc = Arc::from(key);
+            key_to_id.insert(Arc::clone(&arc), next_token);
+            next_token += 1;
+        }
+
         Self {
-            symbol_table: SymbolTable::new(),
+            key_cache,
+            key_to_id,
+            next_token,
         }
     }
 
+    #[inline]
+    fn store_def(&mut self, token: u16, key: &str) -> Result<(), FluxPackError> {
+        if token > crate::MAX_TOKENS {
+            return Err(FluxPackError::TableOverflow);
+        }
+        let arc = self.key_cache.get_or_insert(token, key);
+        self.key_to_id.insert(arc, token);
+        if token >= self.next_token {
+            self.next_token = token + 1;
+        }
+        Ok(())
+    }
+
+    #[inline]
+    fn resolve(&self, token: u16) -> Option<Arc<str>> {
+        self.key_cache.get(token)
+    }
+
     /// Decode a FluxPack stream into a JSON value.
-    /// Handles both inline mode (small payloads) and standard mode.
     pub fn decode(&mut self, input: &[u8]) -> Result<Value, FluxPackError> {
-        // Check for inline mode
         if !input.is_empty() && input[0] == INLINE_MAGIC {
-            let (obj, _) = decode_inline(input)
+            let (obj, _) = crate::inline::decode_inline(input)
                 .map_err(|e| FluxPackError::ColumnarError(e))?;
             return Ok(Value::Object(obj));
         }
@@ -35,13 +111,10 @@ impl Decoder {
 
             match frame_type {
                 0x01 => {
-                    // DEF frame — build the symbol table using EXACT token IDs from the wire.
                     let (token, consumed) = decode_varint(&input[cursor..])?;
                     cursor += consumed;
-
                     let (key_len, consumed) = decode_varint(&input[cursor..])?;
                     cursor += consumed;
-
                     let key_end = cursor + key_len as usize;
                     if key_end > input.len() {
                         return Err(FluxPackError::BufferOverrun);
@@ -49,129 +122,49 @@ impl Decoder {
                     let key = std::str::from_utf8(&input[cursor..key_end])
                         .map_err(|_| FluxPackError::InvalidUtf8)?;
                     cursor = key_end;
-
-                    self.symbol_table.store_def(token as u16, key)?;
+                    self.store_def(token as u16, key)?;
                 }
                 0x02 => {
-                    // DATA frame
                     result = Some(self.decode_data_frame(&input[cursor..])?);
                     break;
                 }
                 0x0D => {
-                    // Columnar DATA frame
                     result = Some(self.decode_columnar_frame(&input[cursor..])?);
                     break;
-                }
-                0xFF => {
-                    // End of stream
-                    break;
-                }
-                _ => {
-                    return Err(FluxPackError::InvalidValueType(frame_type));
-                }
-            }
-        }
-
-        result.ok_or(FluxPackError::MalformedFrame)
-    }
-
-    /// Decode multiple messages from a stream.
-    pub fn decode_all(&mut self, input: &[u8]) -> Result<Vec<Value>, FluxPackError> {
-        let mut results = Vec::new();
-        let mut cursor = 0;
-
-        while cursor < input.len() {
-            // Check for inline mode
-            if input[cursor] == INLINE_MAGIC {
-                let (obj, consumed) = self.decode_inline_at(&input[cursor..])?;
-                cursor += consumed;
-                results.push(obj);
-                continue;
-            }
-
-            let frame_type = input[cursor];
-            cursor += 1;
-
-            match frame_type {
-                0x01 => {
-                    let (token, consumed) = decode_varint(&input[cursor..])?;
-                    cursor += consumed;
-                    let (key_len, consumed) = decode_varint(&input[cursor..])?;
-                    cursor += consumed;
-                    let key_end = cursor + key_len as usize;
-                    if key_end > input.len() {
-                        return Err(FluxPackError::BufferOverrun);
-                    }
-                    let key = std::str::from_utf8(&input[cursor..key_end])
-                        .map_err(|_| FluxPackError::InvalidUtf8)?
-                        .to_string();
-                    cursor = key_end;
-                    self.symbol_table.store_def(token as u16, &key)?;
-                }
-                0x02 => {
-                    let (obj, consumed) = self.decode_data_frame_at(&input[cursor..])?;
-                    cursor += consumed;
-                    results.push(obj);
-                }
-                0x0D => {
-                    let (val, consumed) = self.decode_columnar_frame_at(&input[cursor..])?;
-                    cursor += consumed;
-                    results.push(val);
                 }
                 0xFF => break,
                 _ => return Err(FluxPackError::InvalidValueType(frame_type)),
             }
         }
 
-        Ok(results)
+        result.ok_or(FluxPackError::MalformedFrame)
     }
 
-    /// Decode an inline-encoded message, returning the value and bytes consumed.
-    fn decode_inline_at(&self, input: &[u8]) -> Result<(Value, usize), FluxPackError> {
-        let (obj, consumed) = decode_inline(input)
-            .map_err(|e| FluxPackError::ColumnarError(e))?;
-        Ok((Value::Object(obj), consumed))
-    }
-
-    fn decode_data_frame(&mut self, input: &[u8]) -> Result<Value, FluxPackError> {
-        let (obj, _) = self.decode_data_frame_at(input)?;
-        Ok(obj)
-    }
-
-    /// Decode a DATA frame, returning the value and bytes consumed.
     #[inline]
-    fn decode_data_frame_at(&mut self, input: &[u8]) -> Result<(Value, usize), FluxPackError> {
+    fn decode_data_frame(&mut self, input: &[u8]) -> Result<Value, FluxPackError> {
         let (field_count, mut cursor) = decode_varint(input)?;
-
         let mut obj = Map::with_capacity(field_count as usize);
 
         for _ in 0..field_count {
             let (token, consumed) = decode_varint(&input[cursor..])?;
             cursor += consumed;
 
-            let token_u16 = token as u16;
-            let key = self.symbol_table.resolve(token_u16)
-                .ok_or(FluxPackError::UnknownToken(token_u16))?
-                .to_string();
+            let key_arc = self.resolve(token as u16)
+                .ok_or(FluxPackError::UnknownToken(token as u16))?;
+            // Arc<str> -> String is a single allocation, no copy of Arc internals
+            let key: String = key_arc.to_string();
 
             let (value, consumed) = self.decode_value(&input[cursor..])?;
             cursor += consumed;
-
             obj.insert(key, value);
         }
 
-        Ok((Value::Object(obj), cursor))
+        Ok(Value::Object(obj))
     }
 
     fn decode_columnar_frame(&mut self, input: &[u8]) -> Result<Value, FluxPackError> {
-        let (val, _) = self.decode_columnar_frame_at(input)?;
-        Ok(val)
-    }
-
-    fn decode_columnar_frame_at(&mut self, input: &[u8]) -> Result<(Value, usize), FluxPackError> {
-        let (row_count, columns, consumed) = decode_columnar(input)?;
-        let arr = reconstruct_array(row_count, columns);
-        Ok((arr, consumed))
+        let (row_count, columns, _) = crate::columnar::decode_columnar(input)?;
+        Ok(crate::columnar::reconstruct_array(row_count, columns))
     }
 
     #[inline(always)]
@@ -188,19 +181,16 @@ impl Decoder {
             0x01 => Ok((Value::Bool(true), cursor)),
             0x02 => Ok((Value::Bool(false), cursor)),
             0x03 => {
-                // Signed integer (ZigZag encoded)
                 let (val, consumed) = decode_signed_varint(&input[cursor..])?;
                 cursor += consumed;
                 Ok((Value::Number(Number::from(val)), cursor))
             }
             0x04 => {
-                // Unsigned integer
                 let (val, consumed) = decode_varint(&input[cursor..])?;
                 cursor += consumed;
                 Ok((Value::Number(Number::from(val)), cursor))
             }
             0x05 => {
-                // String
                 let (len, consumed) = decode_varint(&input[cursor..])?;
                 cursor += consumed;
                 let end = cursor + len as usize;
@@ -214,7 +204,6 @@ impl Decoder {
                 Ok((Value::String(s), cursor))
             }
             0x06 => {
-                // Float64 (little-endian for consistency with columnar)
                 if cursor + 8 > input.len() {
                     return Err(FluxPackError::BufferOverrun);
                 }
@@ -230,7 +219,6 @@ impl Decoder {
                 }
             }
             0x07 => {
-                // Float32 (little-endian)
                 if cursor + 4 > input.len() {
                     return Err(FluxPackError::BufferOverrun);
                 }
@@ -245,7 +233,6 @@ impl Decoder {
                 }
             }
             0x08 => {
-                // Bytes — decode as base64-like string for JSON compatibility
                 let (len, consumed) = decode_varint(&input[cursor..])?;
                 cursor += consumed;
                 let end = cursor + len as usize;
@@ -254,12 +241,10 @@ impl Decoder {
                 }
                 let bytes = &input[cursor..end];
                 cursor = end;
-                // Encode as a hex string for JSON compatibility
                 let hex: String = bytes.iter().map(|b| format!("{:02x}", b)).collect();
                 Ok((Value::String(hex), cursor))
             }
             0x09 => {
-                // Array
                 let (len, consumed) = decode_varint(&input[cursor..])?;
                 cursor += consumed;
                 let mut arr = Vec::with_capacity(len as usize);
@@ -271,17 +256,15 @@ impl Decoder {
                 Ok((Value::Array(arr), cursor))
             }
             0x0A => {
-                // Object
                 let (len, consumed) = decode_varint(&input[cursor..])?;
                 cursor += consumed;
                 let mut obj = Map::with_capacity(len as usize);
                 for _ in 0..len {
                     let (token, consumed) = decode_varint(&input[cursor..])?;
                     cursor += consumed;
-                    let token_u16 = token as u16;
-                    let key = self.symbol_table.resolve(token_u16)
-                        .ok_or(FluxPackError::UnknownToken(token_u16))?
-                        .to_string();
+                    let key_arc = self.resolve(token as u16)
+                        .ok_or(FluxPackError::UnknownToken(token as u16))?;
+                    let key: String = key_arc.to_string();
                     let (val, consumed) = self.decode_value(&input[cursor..])?;
                     cursor += consumed;
                     obj.insert(key, val);
@@ -289,50 +272,46 @@ impl Decoder {
                 Ok((Value::Object(obj), cursor))
             }
             0x0B => {
-                // Interned value — resolve from symbol table
                 let (token, consumed) = decode_varint(&input[cursor..])?;
                 cursor += consumed;
-                let key = self.symbol_table.resolve(token as u16)
-                    .ok_or(FluxPackError::UnknownToken(token as u16))?
-                    .to_string();
-                Ok((Value::String(key), cursor))
+                let key_arc = self.resolve(token as u16)
+                    .ok_or(FluxPackError::UnknownToken(token as u16))?;
+                Ok((Value::String(key_arc.to_string()), cursor))
             }
             0x0C => {
-                // Timestamp — decode as ISO 8601 string
                 let (ts, consumed) = decode_varint(&input[cursor..])?;
                 cursor += consumed;
-                // Convert millisecond timestamp to string
                 let secs = ts / 1000;
                 let millis = ts % 1000;
                 let ts_str = format!("{}.{:03}Z", secs, millis);
                 Ok((Value::String(ts_str), cursor))
             }
             0x0D => {
-                // Columnar data embedded as a value
                 let (data_len, consumed) = decode_varint(&input[cursor..])?;
                 cursor += consumed;
                 let end = cursor + data_len as usize;
-                let (row_count, columns, _) = decode_columnar(&input[cursor..end])?;
+                let (row_count, columns, _) = crate::columnar::decode_columnar(&input[cursor..end])?;
                 cursor = end;
-                let arr = reconstruct_array(row_count, columns);
+                let arr = crate::columnar::reconstruct_array(row_count, columns);
                 Ok((arr, cursor))
             }
             _ => Err(FluxPackError::InvalidValueType(value_type)),
         }
     }
 
-    /// Reset the decoder state (clears symbol table).
     pub fn reset(&mut self) {
-        self.symbol_table.reset();
-    }
-
-    /// Get the current symbol table size.
-    pub fn symbol_table_size(&self) -> usize {
-        self.symbol_table.size()
+        self.key_cache = KeyCache::new();
+        self.key_to_id.clear();
+        self.next_token = 1;
+        for &key in COMMON_ML_KEYS {
+            let arc = Arc::from(key);
+            self.key_to_id.insert(arc, self.next_token);
+            self.next_token += 1;
+        }
     }
 }
 
-impl Default for Decoder {
+impl Default for FastDecoder {
     fn default() -> Self {
         Self::new()
     }

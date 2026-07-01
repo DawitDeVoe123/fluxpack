@@ -336,11 +336,18 @@ pub fn decode_columnar(input: &[u8]) -> Result<(usize, Vec<DecodedColumn>, usize
         let (key_len, consumed) = decode_varint(&input[cursor..])?;
         cursor += consumed;
 
-        let key = std::str::from_utf8(&input[cursor..cursor + key_len as usize])
+        let key_end = cursor + key_len as usize;
+        if key_end > input.len() {
+            return Err(crate::FluxPackError::BufferOverrun);
+        }
+        let key = std::str::from_utf8(&input[cursor..key_end])
             .map_err(|_| crate::FluxPackError::InvalidUtf8)?
             .to_string();
-        cursor += key_len as usize;
+        cursor = key_end;
 
+        if cursor >= input.len() {
+            return Err(crate::FluxPackError::BufferOverrun);
+        }
         let col_type = ColType::from_tag(input[cursor])
             .ok_or(crate::FluxPackError::InvalidValueType(input[cursor]))?;
         cursor += 1;

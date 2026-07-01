@@ -15,6 +15,7 @@ pub mod tensor;
 pub mod zero_copy;
 pub mod ml;
 pub mod inline;
+pub mod fast_decoder;
 
 #[cfg(feature = "parallel")]
 pub mod parallel;
@@ -31,6 +32,7 @@ pub use varint::{encode_varint, decode_varint, varint_len, zigzag_encode, zigzag
 pub use error::FluxPackError;
 pub use encoder::Encoder;
 pub use decoder::Decoder;
+pub use fast_decoder::FastDecoder;
 pub use columnar::{try_columnarize, encode_columnar, decode_columnar, reconstruct_array, ColType};
 pub use stream::{StreamWriter, StreamReader, Frame};
 pub use delta::{encode_delta, decode_delta, should_delta_encode};
